@@ -1,0 +1,8 @@
+data/
+
+results/
+*.json
+*.png
+*.log
+
+__pycache__/
