@@ -79,8 +79,8 @@ public class MultiResBenchmark {
 
         // Get total points: use metadata from original file
         int n0 = countTotal(origPath, devicePath, meas);
-        int n10 = n0 / 10;
-        int n100 = n0 / 100;
+        int n10 = countTotal(l10Path, devicePath, meas);
+        int n100 = countTotal(l100Path, devicePath, meas);
 
         long origSize = new File(origPath).length();
         long l0Size = new File(l0Path).length();
@@ -112,15 +112,21 @@ public class MultiResBenchmark {
         for (int si = 0; si < STEP_SIZES.length; si++) {
             int step = STEP_SIZES[si];
 
-            // Route to appropriate level
+            // Route to the coarsest level that can still answer the requested
+            // step exactly. A coarser level than the query step would drop
+            // required points (for example, L10 cannot answer step=2).
             String levelPath;
             String levelName;
             int levelN;
             int levelStep; // step within this level
 
-            if (step <= 1) { levelPath = l0Path; levelName = "L0"; levelN = n0; levelStep = 1; }
-            else if (step <= 10) { levelPath = l10Path; levelName = "L10"; levelN = n10; levelStep = Math.max(1, step / 10); }
-            else { levelPath = l100Path; levelName = "L100"; levelN = n100; levelStep = Math.max(1, step / 100); }
+            if (step >= 100 && step % 100 == 0) {
+                levelPath = l100Path; levelName = "L100"; levelN = n100; levelStep = step / 100;
+            } else if (step >= 10 && step % 10 == 0) {
+                levelPath = l10Path; levelName = "L10"; levelN = n10; levelStep = step / 10;
+            } else {
+                levelPath = l0Path; levelName = "L0"; levelN = n0; levelStep = step;
+            }
 
             long levelFileSize = new File(levelPath).length();
             int expectedTargets = n0 / step;
@@ -187,6 +193,7 @@ public class MultiResBenchmark {
             long multiNs = (System.nanoTime() - t1) / N_MEASURE;
             long totalMultiAvg = totalMulti / N_MEASURE;
             long usefulMultiAvg = usefulMulti / N_MEASURE;
+            boolean correctnessOk = usefulMultiAvg == usefulFullAvg;
 
             // Read amplification
             long usefulBytes = Math.max(usefulFullAvg, 1) * 16;
@@ -212,6 +219,7 @@ public class MultiResBenchmark {
                     String.format("%.1f", 100.0 * (n0 - totalMultiAvg) / n0) + ",");
             System.out.println("   \"single_useful\":" + usefulFullAvg + ",");
             System.out.println("   \"multi_useful\":" + usefulMultiAvg + ",");
+            System.out.println("   \"correctness_ok\":" + correctnessOk + ",");
             System.out.println("   \"single_read_amp\":" + String.format("%.1f", singleAmp) + ",");
             System.out.println("   \"multi_read_amp\":" + String.format("%.1f", multiAmp) + ",");
             System.out.println("   \"amp_improvement_pct\":" +

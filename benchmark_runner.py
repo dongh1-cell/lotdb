@@ -8,6 +8,7 @@ Collects: wall time, CPU time (user/sys), time breakdown (IO/decompress/filter),
 import os
 import gc
 import json
+import sys
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -33,6 +34,8 @@ except Exception:
 
 import config as cfg
 from metrics import QueryMeasurer
+
+PARQUET_P4_SAMPLE_WINDOWS = 50
 
 # TsFile support via native Java subprocess (no JPype overhead)
 try:
@@ -269,45 +272,49 @@ class HDF5Querier:
     def sequential_scan(self, device, measurement, time_start, time_end):
         with h5py.File(self.data_path, "r") as f:
             times = f[f"{device}/{measurement}/time"][:]
+            values = f[f"{device}/{measurement}/value"][:]
         mask = np.ones(len(times), dtype=bool)
         if time_start is not None:
             mask &= (times >= time_start)
         if time_end is not None:
             mask &= (times <= time_end)
-        return int(mask.sum())
+        return len(values[mask])
 
     def column_subset(self, device, target_measurements, time_start, time_end):
         total = 0
         with h5py.File(self.data_path, "r") as f:
             for meas in target_measurements:
                 times = f[f"{device}/{meas}/time"][:]
+                values = f[f"{device}/{meas}/value"][:]
                 mask = np.ones(len(times), dtype=bool)
                 if time_start is not None:
                     mask &= (times >= time_start)
                 if time_end is not None:
                     mask &= (times <= time_end)
-                total += int(mask.sum())
+                total += len(values[mask])
         return total
 
     def downsampling(self, device, measurement, time_start, time_end, step_n):
         with h5py.File(self.data_path, "r") as f:
             times = f[f"{device}/{measurement}/time"][:]
+            values = f[f"{device}/{measurement}/value"][:]
         mask = np.ones(len(times), dtype=bool)
         if time_start is not None:
             mask &= (times >= time_start)
         if time_end is not None:
             mask &= (times <= time_end)
         idx = np.where(mask)[0]
-        return len(idx[::step_n])
+        return len(values[idx[::step_n]])
 
     def random_windows(self, device, target_measurements, windows):
         total = 0
         with h5py.File(self.data_path, "r") as f:
             for meas in target_measurements:
                 times = f[f"{device}/{meas}/time"][:]
+                values = f[f"{device}/{meas}/value"][:]
                 for (t_start, t_end) in windows:
                     mask = (times >= t_start) & (times <= t_end)
-                    total += int(mask.sum())
+                    total += len(values[mask])
         return total
 
 
@@ -368,11 +375,14 @@ def run_pattern_2_column_subset(queriers, devices, measurements, n_runs=5):
             selected = rng.choice(measurements, n_cols, replace=False).tolist()
 
             for format_name, q in queriers.items():
-                # Sum byte costs across selected measurements
+                # Byte cost: Arrow reads file once; others per-column
                 byte_cost = 0
                 if hasattr(q, '_cost'):
-                    for m in selected:
-                        byte_cost += q._cost(device, m)
+                    if format_name == 'arrow':
+                        byte_cost = q._cost(device, selected[0]) if selected else 0
+                    else:
+                        for m in selected:
+                            byte_cost += q._cost(device, m)
 
                 args = (device, selected, t_start, t_end)
                 metrics = _run_query_with_metrics(q, "column_subset", args, byte_cost)
@@ -453,19 +463,43 @@ def run_pattern_4_random_windows(queriers, devices, measurements):
 
     for dev_idx, device in enumerate(test_devices):
         for format_name, q in queriers.items():
+            is_parquet_estimate = format_name == "parquet"
+            query_windows = windows[:PARQUET_P4_SAMPLE_WINDOWS] if is_parquet_estimate else windows
+            scale = (len(windows) / len(query_windows)) if is_parquet_estimate else 1.0
+
             # Byte cost: each window touches a subset of the measurement's data
             # Estimate: windows cover (window_span_s * n_windows / total_span) fraction
             fraction = min(1.0, (window_span_s * cfg.RANDOM_WINDOW_COUNT)
                            / total_seconds)
             byte_cost = 0
             if hasattr(q, '_cost'):
-                for m in target_measurements:
-                    byte_cost += int(q._cost(device, m) * fraction)
+                if format_name == 'arrow':
+                    byte_cost = q._cost(device, target_measurements[0]) if target_measurements else 0
+                elif format_name == 'hdf5':
+                    for m in target_measurements:
+                        byte_cost += q._cost(device, m)
+                else:
+                    for m in target_measurements:
+                        byte_cost += int(q._cost(device, m) * fraction)
 
-            args = (device, target_measurements, windows)
+            args = (device, target_measurements, query_windows)
             metrics = _run_query_with_metrics(q, "random_windows", args, byte_cost)
+            if is_parquet_estimate:
+                metrics["wall_time_s"] *= scale
+                metrics["cpu_user_s"] *= scale
+                metrics["cpu_sys_s"] *= scale
+                metrics["points_returned"] = int(round(metrics["points_returned"] * scale))
+                metrics["bytes_useful"] = metrics["points_returned"] * 16
+                metrics["read_amplification"] = (
+                    metrics["bytes_read"] / metrics["bytes_useful"]
+                    if metrics["bytes_useful"] > 0 else 0.0
+                )
+                metrics["throughput_mbps"] = (
+                    metrics["bytes_useful"] / 1e6 / metrics["wall_time_s"]
+                    if metrics["wall_time_s"] > 0 else 0.0
+                )
 
-            results.append({
+            row = {
                 "pattern": "random_windows",
                 "format": format_name,
                 "device": str(device),
@@ -473,7 +507,13 @@ def run_pattern_4_random_windows(queriers, devices, measurements):
                 "n_measurements": len(target_measurements),
                 "window_length": cfg.RANDOM_WINDOW_LENGTH,
                 **metrics,
-            })
+            }
+            if is_parquet_estimate:
+                row["estimated"] = True
+                row["sample_windows"] = len(query_windows)
+                row["scale_factor"] = scale
+                row["estimate_method"] = "linear extrapolation from sampled random windows"
+            results.append(row)
             gc.collect()
 
         print(f"  [random_windows] device {dev_idx + 1}/{len(test_devices)}: {device}")

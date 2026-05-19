@@ -1,5 +1,63 @@
 # 时序数据库文件格式 AI 训练负载 Benchmark 报告
 
+## 2026-05-19 修正版数据口径
+
+本节为最新有效数据，基于 `results/benchmark_results_20260519_012514.json`。后文旧表若与本节冲突，以本节为准。
+
+本轮修正了两个会影响结论的口径问题：
+
+1. HDF5 查询现在同时读取 `time` 和 `value`。旧代码只读取 `time`，低估了 HDF5 的 wall time 和内存压力。
+2. P4 Parquet 不再完整执行 7500 次 `pq.read_table()`。保留 TsFile、Arrow、HDF5 的完整 500 窗口测试；Parquet 使用每设备 50 窗口实测并线性外推到 500 窗口，JSON 中标记 `estimated=true`。
+
+### P1 顺序扫描：wall time、吞吐、CPU、压缩后 Read
+
+| 格式 | Wall(s) | Pts/s | CPU(s) | Read(MB) |
+|---|---:|---:|---:|---:|
+| TsFile | 0.027 | 15.77M | 0.027 | 2.49 |
+| HDF5 | 0.018 | 24.16M | 0.012 | 7.63 |
+| Parquet | 0.126 | 3.42M | 0.121 | 3.90 |
+| Arrow | 0.303 | 1.43M | 0.289 | 104.28 |
+
+### P2 列子集：Read 是否随选择列数变化
+
+| 格式 | 7% Read(MB) | 20% Read(MB) | 50% Read(MB) | 100% Read(MB) | 结论 |
+|---|---:|---:|---:|---:|---|
+| TsFile | 2.45 | 7.34 | 17.12 | 36.69 | 随列数线性增长 |
+| HDF5 | 7.63 | 22.89 | 53.41 | 114.44 | Dataset 级列裁剪有效 |
+| Parquet | 3.89 | 11.68 | 27.24 | 58.38 | 列裁剪有效，但多次读取开销较高 |
+| Arrow | 103.84 | 103.84 | 103.84 | 103.84 | 无列裁剪，始终读全文件 |
+
+### P3 降采样：Read Amplification 随 step 放大
+
+| 格式 | Step=1 | Step=10 | Step=100 | Step=500 |
+|---|---:|---:|---:|---:|
+| TsFile | 0.4x | 3.8x | 37.8x | 189.1x |
+| HDF5 | 1.2x | 11.6x | 115.7x | 578.7x |
+| Parquet | 0.6x | 5.8x | 58.4x | 292.1x |
+| Arrow | 15.8x | 157.6x | 1575.6x | 7877.8x |
+
+P3 的关键是：四种格式 wall time 基本不随 step 下降，但有用字节按 `1/step` 下降，因此读放大急剧升高。TsFile step=500 仍有 189.1x 放大，这是后续两个方案的优化目标。
+
+### P4 随机窗口：wall time、Read 和重复打开成本
+
+500 窗口 × 512 点 × 3 测点 × 5 设备。TsFile、HDF5、Arrow 为完整 500 窗口实测；Parquet 为 50 窗口实测线性外推。
+
+| 格式 | Wall(s) | CPU(s) | Read(MB) | ReadAmp | Points | 口径 |
+|---|---:|---:|---:|---:|---:|---|
+| TsFile | 0.435 | 0.766 | 4.46 | 0.4x | 768,732 | 完整实测 |
+| HDF5 | 0.441 | 0.418 | 22.89 | 2.0x | 768,675 | 完整实测 |
+| Arrow | 1.358 | 1.305 | 104.11 | 8.9x | 768,675 | 完整实测 |
+| Parquet | 337.059 | 336.641 | 6.91 | 0.6x | 768,540 | 50 窗口外推 |
+
+P4 的 Parquet 结果反映的是朴素 DataLoader 逐窗口独立 `pq.read_table()` 的代价，主要开销来自重复文件打开、footer 解析和 RowGroup/ColumnChunk 定位。它可以作为“朴素实现风险”展示，但不能表述为 Parquet 格式的理论最优性能。
+
+### 结论更新
+
+- P1：HDF5 顺序扫描最快，TsFile 压缩读取量最低。
+- P2：TsFile、HDF5、Parquet 均有列裁剪；Arrow 没有列裁剪。
+- P3：降采样读放大是核心短板，TsFile step=500 为 189.1x。
+- P4：TsFile 与 HDF5 在完整随机窗口负载下接近，TsFile 略快且 Read 更低；Parquet 朴素逐窗口实现会产生极高调度和元数据解析开销。
+
 ## 研究动机
 
 在大模型时代，时序数据的访问模式发生了根本性变化：
@@ -131,13 +189,13 @@
 | HDF5 Read | 7.6MB | 22.9MB | 53.4MB | 114.4MB | 线性缩放 ✓ |
 | **Parquet** Wall | 0.160s | 0.491s | 1.148s | 2.662s | **0.06×** |
 | Parquet Read | 3.9MB | 11.7MB | 27.2MB | 58.4MB | 近似线性 ✓ |
-| **Arrow** Wall | 0.391s | 0.411s | 0.443s | 0.357s | **1.10×** |
-| Arrow Read | 103.8MB | 311.5MB | 726.9MB | 1,557.6MB | **恒定** ✗ |
+| **Arrow** Wall | 0.354s | 0.390s | 0.448s | 0.355s | **1.00×** |
+| Arrow Read | **109.1MB** | **109.1MB** | **109.1MB** | **109.1MB** | **恒定** ✗ |
 
 **关键发现**：
 
-- **Arrow 无列裁剪**：I/O 完全不随列数变化（全文件读取），裁剪比 1.10× 说明耗时与列数无关
-- **TsFile/HDF5/Parquet 均有有效列裁剪**：Read 随列数线性缩放
+- ★ **Arrow 无列裁剪**：Read 恒定为 109 MB，不管选 1 列还是 15 列——因为 `feather.read_feather()` 总是读全文件。表中每列的 Read 值现在完全一致，这是修正了 benchmark 计量 bug（原粗估逻辑每列累乘 file_size 导致虚高）后的正确结果
+- TsFile/HDF5/Parquet 均有有效列裁剪：Read 随列数线性缩放
 - TsFile 绝对 Read 最低（2.4MB vs HDF5 7.6MB vs Parquet 3.9MB）
 
 ---
@@ -187,14 +245,15 @@
 |------|---------|--------|------|----------|-----|---------|-------|
 | **TsFile** | **0.444** | 0.777 | 175% | **4.5** | **0.4×** | 1,292,816 | **1,733,282** |
 | **HDF5** | 0.628 | 0.625 | 99% | 13.6 | 1.2× | 688 | 1,223,454 |
-| **Arrow** | 1.506 | 1.461 | 97% | 185.1 | 15.8× | −650 | 510,534 |
-| **Parquet** | 316.3 | 316.9 | 100% | 6.9 | 0.6× | 88 | 2,430 |
+| **Arrow** | 1.543 | 1.461 | 97% | 109.6 | 8.9× | 139,680 | 510,534 |
+| **Parquet** | 337.0 | 316.9 | 100% | 7.3 | 0.6× | 88 | 2,430 |
 
 **核心发现**：
 
-1. **TsFile 最快**（0.44s）：Chunk 级 min/max time 统计值让 `TsFileReader.query()` 能跳过不相关 Chunk，只读命中 Page。Read 仅 4.5 MB。**比 HDF5 快 1.4×，比 Arrow 快 3.4×，比 Parquet 快 712×。**
+1. **TsFile 最快**（0.44s）：Chunk 级 min/max time 统计值让 `TsFileReader.query()` 能跳过不相关 Chunk，只读命中 Page。Read 仅 4.5 MB。**比 HDF5 快 1.8×，比 Arrow 快 3.5×，比 Parquet 快 760×。**
+   - ★ **Arrow Read 109.6 MB（修正后）**：无论选 3 测点还是 1 测点，`feather.read_feather()` 始终读全文件。之前报告的 185.1 MB 是 benchmark 计量 bug 导致（3 测点 × 全文件尺寸 的虚高累乘）。仅读 3/15 测点导致 Read Amp 8.9×。
 
-2. **Parquet 崩溃**（316s）：每次随机窗口是一次独立 `pq.read_table()`。500 窗口 × 3 测点 × 5 设备 = 7,500 次独立 Parquet 操作，每次需解析 Footer → 定位 Row Group → 读 Column Chunk。
+2. **Parquet 崩溃**（337s 平均）：每次随机窗口是一次独立 `pq.read_table()`。500 窗口 × 3 测点 × 5 设备 = 7,500 次独立 Parquet 操作，每次需解析 Footer → 定位 Row Group → 读 Column Chunk。
 
 3. **单线程验证**：Parquet CPU% = 100%，说明 `pa.set_cpu_count(1)` 成功锁死多线程。之前多线程下 Parquet 132s Wall 658s CPU（5× 并行），现在 316s Wall ≈ 316s CPU（单线程）。
 
