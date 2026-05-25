@@ -164,6 +164,10 @@ public class MultiResBenchmark {
             long usefulFullAvg = usefulFull / N_MEASURE;
 
             // --- Multi-res: query appropriate level, iterate and sample ---
+            boolean correctnessOk = valuesEqual(
+                    readSampledValues(origPath, devicePath, meas, step),
+                    readSampledValues(levelPath, devicePath, meas, levelStep));
+
             for (int w = 0; w < N_WARMUP; w++) {
                 TsFileSequenceReader seq = new TsFileSequenceReader(levelPath);
                 TsFileReader ts = new TsFileReader(seq);
@@ -193,7 +197,7 @@ public class MultiResBenchmark {
             long multiNs = (System.nanoTime() - t1) / N_MEASURE;
             long totalMultiAvg = totalMulti / N_MEASURE;
             long usefulMultiAvg = usefulMulti / N_MEASURE;
-            boolean correctnessOk = usefulMultiAvg == usefulFullAvg;
+            correctnessOk = correctnessOk && usefulMultiAvg == usefulFullAvg;
 
             // Read amplification
             long usefulBytes = Math.max(usefulFullAvg, 1) * 16;
@@ -239,5 +243,47 @@ public class MultiResBenchmark {
         for (var cm : metas) total += (int) cm.getNumOfPoints();
         r.close();
         return total;
+    }
+
+    static List<Double> readSampledValues(String filePath, String device, String meas,
+                                          int sampleStep) throws Exception {
+        TsFileSequenceReader seq = new TsFileSequenceReader(filePath);
+        TsFileReader ts = new TsFileReader(seq);
+        Path p = new Path(device, meas, true);
+        var ds = ts.query(QueryExpression.create(Collections.singletonList(p), null));
+        List<Double> values = new ArrayList<>();
+        int idx = 0;
+        while (ds.hasNext()) {
+            var row = ds.next();
+            if (idx % sampleStep == 0) {
+                values.add(firstDouble(row.getFields()));
+            }
+            idx++;
+        }
+        ts.close();
+        seq.close();
+        return values;
+    }
+
+    static double firstDouble(List<org.apache.tsfile.read.common.Field> fields) {
+        for (var field : fields) {
+            if (field == null) continue;
+            try {
+                return field.getDoubleV();
+            } catch (Exception ignored) {
+            }
+        }
+        return Double.NaN;
+    }
+
+    static boolean valuesEqual(List<Double> a, List<Double> b) {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            double av = a.get(i);
+            double bv = b.get(i);
+            if (Double.isNaN(av) || Double.isNaN(bv)) return false;
+            if (Math.abs(av - bv) > 1e-9) return false;
+        }
+        return true;
     }
 }

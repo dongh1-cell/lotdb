@@ -16,12 +16,13 @@
  */
 
 import org.apache.tsfile.enums.TSDataType;
-import org.apache.tsfile.file.header.PageHeader;
-import org.apache.tsfile.file.metadata.ChunkMetadata;
 import org.apache.tsfile.file.metadata.IDeviceID;
 import org.apache.tsfile.file.metadata.enums.CompressionType;
 import org.apache.tsfile.file.metadata.enums.TSEncoding;
+import org.apache.tsfile.read.TsFileReader;
 import org.apache.tsfile.read.TsFileSequenceReader;
+import org.apache.tsfile.read.common.Path;
+import org.apache.tsfile.read.expression.QueryExpression;
 import org.apache.tsfile.write.TsFileWriter;
 import org.apache.tsfile.write.schema.MeasurementSchema;
 import org.apache.tsfile.write.schema.IMeasurementSchema;
@@ -74,35 +75,33 @@ public class MultiResTsFileBuilder {
             }
             Collections.sort(measurements);
 
-            // Read all values: Map<measurement, List<Double>>
+            // Read all values through the public query API. The previous
+            // version decoded pages manually and could silently write null data
+            // when compression/encoding assumptions did not match the file.
+            List<Long> times = new ArrayList<>();
             Map<String, List<Double>> allVals = new LinkedHashMap<>();
-            Map<String, Long> measCosts = new LinkedHashMap<>();
             for (String meas : measurements) allVals.put(meas, new ArrayList<>());
 
             for (String meas : measurements) {
-                long cost = 0;
-                for (ChunkMetadata cm : reader.getChunkMetadataList(device, meas, true)) {
-                    try {
-                        org.apache.tsfile.read.common.Chunk ch = reader.readMemChunk(cm);
-                        cost += ch.getHeader().getDataSize();
-                        ByteBuffer cb = ch.getData().duplicate();
-                        while (cb.hasRemaining()) {
-                            try {
-                                PageHeader ph = PageHeader.deserializeFrom(cb, TSDataType.DOUBLE);
-                                byte[] comp = new byte[ph.getCompressedSize()];
-                                cb.get(comp);
-                                byte[] raw = org.xerial.snappy.Snappy.uncompress(comp);
-                                ByteBuffer decBuf = ByteBuffer.wrap(raw);
-                                var dec = new org.apache.tsfile.encoding.decoder
-                                        .DoublePrecisionDecoderV1();
-                                int nv = (int) ph.getNumOfValues();
-                                for (int i = 0; i < nv && decBuf.hasRemaining(); i++)
-                                    allVals.get(meas).add(dec.readDouble(decBuf));
-                            } catch (Exception e) { break; }
-                        }
-                    } catch (Exception e) { continue; }
+                TsFileSequenceReader seq = new TsFileSequenceReader(files[fi].getAbsolutePath());
+                TsFileReader ts = new TsFileReader(seq);
+                Path p = new Path(devicePath, meas, true);
+                var ds = ts.query(QueryExpression.create(Collections.singletonList(p), null));
+                List<Double> vals = allVals.get(meas);
+                int rowIdx = 0;
+                while (ds.hasNext()) {
+                    var row = ds.next();
+                    if (times.size() <= rowIdx) {
+                        times.add(row.getTimestamp());
+                    } else if (!times.get(rowIdx).equals(row.getTimestamp())) {
+                        throw new IllegalStateException("Timestamp mismatch at row " + rowIdx
+                                + " for measurement " + meas);
+                    }
+                    vals.add(firstDouble(row.getFields()));
+                    rowIdx++;
                 }
-                measCosts.put(meas, cost);
+                ts.close();
+                seq.close();
             }
             reader.close();
 
@@ -116,11 +115,11 @@ public class MultiResTsFileBuilder {
 
             // ---- Write L10 ----
             String l10Path = new File(outDir, devName + "_L10.tsfile").getAbsolutePath();
-            writeLevel(l10Path, devicePath, measurements, allVals, 10, N10, BATCH_SIZE);
+            writeLevel(l10Path, devicePath, measurements, times, allVals, 10, N10, BATCH_SIZE);
 
             // ---- Write L100 ----
             String l100Path = new File(outDir, devName + "_L100.tsfile").getAbsolutePath();
-            writeLevel(l100Path, devicePath, measurements, allVals, 100, N100, BATCH_SIZE);
+            writeLevel(l100Path, devicePath, measurements, times, allVals, 100, N100, BATCH_SIZE);
 
             long elapsed = (System.nanoTime() - t0) / 1_000_000;
 
@@ -139,9 +138,12 @@ public class MultiResTsFileBuilder {
     }
 
     static void writeLevel(String path, String devicePath, List<String> measurements,
-                           Map<String, List<Double>> allVals, int step, int N,
+                           List<Long> times, Map<String, List<Double>> allVals, int step, int N,
                            int batchSize) throws Exception {
         File f = new File(path);
+        if (f.exists() && !f.delete()) {
+            throw new IOException("Cannot replace existing file: " + path);
+        }
         TsFileWriter writer = new TsFileWriter(f);
 
         List<IMeasurementSchema> schemas = new ArrayList<>();
@@ -152,17 +154,15 @@ public class MultiResTsFileBuilder {
         writer.registerAlignedTimeseries(devicePath, schemas);
 
         Tablet tablet = new Tablet(devicePath, schemas, batchSize);
-        // Use time index as timestamps (relative, consistent across levels)
-        long baseTime = 0;
 
         for (int batchStart = 0; batchStart < N; batchStart += batchSize) {
             int batchEnd = Math.min(batchStart + batchSize, N);
             tablet.reset();
+            tablet.setRowSize(batchEnd - batchStart);
 
             for (int row = 0; row < batchEnd - batchStart; row++) {
                 int globalIdx = (batchStart + row) * step;
-                long timestamp = (long) globalIdx;
-                tablet.addTimestamp(row, timestamp);
+                tablet.addTimestamp(row, times.get(globalIdx));
 
                 for (int ci = 0; ci < measurements.size(); ci++) {
                     String meas = measurements.get(ci);
@@ -174,5 +174,16 @@ public class MultiResTsFileBuilder {
             writer.writeTree(tablet);
         }
         writer.close();
+    }
+
+    static double firstDouble(List<org.apache.tsfile.read.common.Field> fields) {
+        for (var field : fields) {
+            if (field == null) continue;
+            try {
+                return field.getDoubleV();
+            } catch (Exception ignored) {
+            }
+        }
+        throw new IllegalStateException("No DOUBLE value in row fields: " + fields);
     }
 }
