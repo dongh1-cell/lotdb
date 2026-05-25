@@ -65,7 +65,7 @@ def _ensure_compiled():
     return classes_dir
 
 
-def run_benchmark(tsfile_dir, lazy=False):
+def run_benchmark(tsfile_dir, lazy=False, java_props=None):
     """Run native TsFile benchmark and return results with memory stats.
 
     Args:
@@ -81,6 +81,9 @@ def run_benchmark(tsfile_dir, lazy=False):
     cmd = ["java", "-cp", cp]
     if lazy:
         cmd.append("-Dtsfile.lazy.page.load=true")
+    if java_props:
+        for key, value in java_props.items():
+            cmd.append(f"-D{key}={value}")
     cmd.extend(["TsFileNativeRunner", ts_dir])
 
     # ── Launch with Popen; drain stdout in thread to avoid pipe deadlock ──

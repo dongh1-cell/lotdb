@@ -106,7 +106,8 @@ public class MultiResTsFileBuilder {
             reader.close();
 
             int N = allVals.get(measurements.get(0)).size();
-            int N10 = N / 10, N100 = N / 100;
+            int N10 = ceilDiv(N, 10);
+            int N100 = ceilDiv(N, 100);
 
             // ---- Write L0 (copy original) ----
             Files.copy(files[fi].toPath(),
@@ -174,6 +175,10 @@ public class MultiResTsFileBuilder {
             writer.writeTree(tablet);
         }
         writer.close();
+    }
+
+    static int ceilDiv(int value, int divisor) {
+        return (value + divisor - 1) / divisor;
     }
 
     static double firstDouble(List<org.apache.tsfile.read.common.Field> fields) {

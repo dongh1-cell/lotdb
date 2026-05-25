@@ -39,23 +39,26 @@ public class TsFileNativeRunner {
     static Map<String, LazyTsFileQuerier> lazyReaders = new HashMap<>();
 
     // ── Benchmark config (matches config.py) ──
-    static final long BASE_START = 1704038400L;
-    static final int DURATION_DAYS = 10;
-    static final long TOTAL_SECONDS = DURATION_DAYS * 86400L;
-    static final int INTERVAL_SECONDS = 2;
-    static final int POINTS_PER_SERIES = (int)(TOTAL_SECONDS / INTERVAL_SECONDS);
+    static long BASE_START = Long.getLong("bench.base.start", Long.MIN_VALUE);
+    static long QUERY_END = Long.getLong("bench.query.end", Long.MIN_VALUE);
+    static long TOTAL_SECONDS = 10L * 86400L;
+    static int INTERVAL_SECONDS = Integer.getInteger("bench.interval.seconds", 2);
 
     static final int[] SAMPLING_RATES = {1, 10, 100, 500};
     static final double[] COLUMN_SELECTIVITIES = {0.07, 0.20, 0.50, 1.0};
-    static final int N_RUNS = 5;
-    static final int WARMUP_RUNS = 3;
-    static final int RANDOM_WINDOW_COUNT = 500;
-    static final int RANDOM_WINDOW_LENGTH = 512;
-    static final int TARGET_DEVICES_FOR_RANDOM = 5;
+    static final int N_RUNS = Integer.getInteger("bench.n.runs", 5);
+    static final int WARMUP_RUNS = Integer.getInteger("bench.warmup.runs", 3);
+    static final int RANDOM_WINDOW_COUNT = Integer.getInteger("bench.random.window.count", 500);
+    static final int RANDOM_WINDOW_LENGTH = Integer.getInteger("bench.random.window.length", 512);
+    static final int TARGET_DEVICES_FOR_RANDOM = Integer.getInteger("bench.random.target.devices", 5);
+    static final int RANDOM_TARGET_MEASUREMENTS = Integer.getInteger("bench.random.target.measurements", -1);
 
     static String DEVICE_PATH;
     static List<String> ALL_MEASUREMENTS = new ArrayList<>();
     static Map<String, String> deviceFiles = new LinkedHashMap<>();
+    static Map<String, String> devicePaths = new LinkedHashMap<>();
+    static Map<String, Long> deviceStartTimes = new LinkedHashMap<>();
+    static Map<String, Long> deviceEndTimes = new LinkedHashMap<>();
     static OperatingSystemMXBean osBean;
 
     public static void main(String[] args) throws Exception {
@@ -73,7 +76,7 @@ public class TsFileNativeRunner {
             System.exit(1);
         }
 
-        // Discover measurements
+        // Discover measurements, per-file device paths, and query time range.
         String firstFile = deviceFiles.values().iterator().next();
         TsFileSequenceReader r = new TsFileSequenceReader(firstFile);
         List<IDeviceID> devs = r.getAllDevices();
@@ -84,6 +87,7 @@ public class TsFileNativeRunner {
         }
         Collections.sort(ALL_MEASUREMENTS);
         r.close();
+        discoverDevicePathsAndTimeRange();
 
         List<String> devices = new ArrayList<>(deviceFiles.keySet());
 
@@ -110,10 +114,10 @@ public class TsFileNativeRunner {
             String meas = ALL_MEASUREMENTS.get(rng.nextInt(ALL_MEASUREMENTS.size()));
             if (LAZY_MODE) {
                 LazyTsFileQuerier lq = openLazyReader(dev);
-                lq.countRows(DEVICE_PATH, meas, BASE_START, BASE_START + TOTAL_SECONDS);
+                lq.countRows(devicePath(dev), meas, BASE_START, QUERY_END);
             } else {
                 TsFileReader ts = openReader(dev);
-                queryCount(ts, meas, BASE_START, BASE_START + TOTAL_SECONDS);
+                queryCount(ts, devicePath(dev), meas, BASE_START, QUERY_END);
                 ts.close();
             }
         }
@@ -121,6 +125,39 @@ public class TsFileNativeRunner {
         if (LAZY_MODE) {
             closeAllLazyReaders();
         }
+    }
+
+    static void discoverDevicePathsAndTimeRange() throws Exception {
+        long minStart = Long.MAX_VALUE;
+        long maxEnd = Long.MIN_VALUE;
+        for (Map.Entry<String, String> e : deviceFiles.entrySet()) {
+            TsFileSequenceReader reader = new TsFileSequenceReader(e.getValue());
+            List<IDeviceID> devs = reader.getAllDevices();
+            if (devs.isEmpty()) {
+                reader.close();
+                continue;
+            }
+            IDeviceID did = devs.get(0);
+            devicePaths.put(e.getKey(), did.toString());
+            if (!ALL_MEASUREMENTS.isEmpty()) {
+                long devStart = Long.MAX_VALUE;
+                long devEnd = Long.MIN_VALUE;
+                List<ChunkMetadata> metas =
+                        reader.getChunkMetadataList(did, ALL_MEASUREMENTS.get(0), true);
+                for (ChunkMetadata cm : metas) {
+                    devStart = Math.min(devStart, cm.getStartTime());
+                    devEnd = Math.max(devEnd, cm.getEndTime());
+                    minStart = Math.min(minStart, cm.getStartTime());
+                    maxEnd = Math.max(maxEnd, cm.getEndTime());
+                }
+                deviceStartTimes.put(e.getKey(), devStart);
+                deviceEndTimes.put(e.getKey(), devEnd);
+            }
+            reader.close();
+        }
+        if (BASE_START == Long.MIN_VALUE) BASE_START = minStart;
+        if (QUERY_END == Long.MIN_VALUE) QUERY_END = maxEnd;
+        TOTAL_SECONDS = Math.max(1, QUERY_END - BASE_START + 1);
     }
 
     // ── File discovery ──
@@ -138,9 +175,9 @@ public class TsFileNativeRunner {
 
     // ── Query helpers ──
 
-    static int queryCount(TsFileReader tsReader, String measurement,
+    static int queryCount(TsFileReader tsReader, String devicePath, String measurement,
                           long timeStart, long timeEnd) throws Exception {
-        Path path = new Path(DEVICE_PATH, measurement, true);
+        Path path = new Path(devicePath, measurement, true);
         QueryExpression expr;
         if (timeStart >= 0 && timeEnd >= 0) {
             org.apache.tsfile.read.filter.basic.Filter f1 = TimeFilterApi.gtEq(timeStart);
@@ -218,7 +255,7 @@ public class TsFileNativeRunner {
         List<Map<String, Object>> results = new ArrayList<>();
         Random rng = new Random(42 + 100);
         long tStart = BASE_START;
-        long tEnd = BASE_START + TOTAL_SECONDS;
+        long tEnd = QUERY_END;
 
         for (int run = 0; run < N_RUNS; run++) {
             String device = devices.get(rng.nextInt(devices.size()));
@@ -232,7 +269,7 @@ public class TsFileNativeRunner {
                 LazyTsFileQuerier lq = openLazyReader(device);
                 cpu0 = getProcessCpuNs();
                 t0 = System.nanoTime();
-                n = lq.countRows(DEVICE_PATH, measurement, tStart, tEnd);
+                n = lq.countRows(devicePath(device), measurement, tStart, tEnd);
                 t1 = System.nanoTime();
                 cpu1 = getProcessCpuNs();
                 bytesRead = lq.getLastBytesRead();
@@ -240,7 +277,7 @@ public class TsFileNativeRunner {
                 TsFileReader tsReader = openReader(device);
                 cpu0 = getProcessCpuNs();
                 t0 = System.nanoTime();
-                n = queryCount(tsReader, measurement, tStart, tEnd);
+                n = queryCount(tsReader, devicePath(device), measurement, tStart, tEnd);
                 t1 = System.nanoTime();
                 cpu1 = getProcessCpuNs();
                 tsReader.close();
@@ -259,7 +296,7 @@ public class TsFileNativeRunner {
         List<Map<String, Object>> results = new ArrayList<>();
         Random rng = new Random(42 + 200);
         long tStart = BASE_START;
-        long tEnd = BASE_START + TOTAL_SECONDS;
+        long tEnd = QUERY_END;
 
         for (int run = 0; run < N_RUNS; run++) {
             String device = devices.get(rng.nextInt(devices.size()));
@@ -279,7 +316,7 @@ public class TsFileNativeRunner {
                     cpu0 = getProcessCpuNs();
                     t0 = System.nanoTime();
                     for (String meas : selected) {
-                        total += lq.countRows(DEVICE_PATH, meas, tStart, tEnd);
+                        total += lq.countRows(devicePath(device), meas, tStart, tEnd);
                         bytesRead += lq.getLastBytesRead();
                     }
                     t1 = System.nanoTime();
@@ -289,7 +326,7 @@ public class TsFileNativeRunner {
                     cpu0 = getProcessCpuNs();
                     t0 = System.nanoTime();
                     for (String meas : selected) {
-                        total += queryCount(tsReader, meas, tStart, tEnd);
+                        total += queryCount(tsReader, devicePath(device), meas, tStart, tEnd);
                     }
                     t1 = System.nanoTime();
                     cpu1 = getProcessCpuNs();
@@ -302,7 +339,7 @@ public class TsFileNativeRunner {
                 r.put("selectivity", sel);
                 r.put("n_cols_requested", nCols);
                 r.put("n_cols_total", ALL_MEASUREMENTS.size());
-                r.put("time_range_days", DURATION_DAYS);
+                r.put("time_range_seconds", TOTAL_SECONDS);
                 results.add(r);
             }
         }
@@ -315,7 +352,7 @@ public class TsFileNativeRunner {
         List<Map<String, Object>> results = new ArrayList<>();
         Random rng = new Random(42 + 300);
         long tStart = BASE_START;
-        long tEnd = BASE_START + TOTAL_SECONDS;
+        long tEnd = QUERY_END;
 
         for (int run = 0; run < N_RUNS; run++) {
             String device = devices.get(rng.nextInt(devices.size()));
@@ -330,7 +367,7 @@ public class TsFileNativeRunner {
                     LazyTsFileQuerier lq = openLazyReader(device);
                     cpu0 = getProcessCpuNs();
                     t0 = System.nanoTime();
-                    total = lq.countRows(DEVICE_PATH, measurement, tStart, tEnd);
+                    total = lq.countRows(devicePath(device), measurement, tStart, tEnd);
                     t1 = System.nanoTime();
                     cpu1 = getProcessCpuNs();
                     bytesRead = lq.getLastBytesRead();
@@ -338,7 +375,7 @@ public class TsFileNativeRunner {
                     TsFileReader tsReader = openReader(device);
                     cpu0 = getProcessCpuNs();
                     t0 = System.nanoTime();
-                    total = queryCount(tsReader, measurement, tStart, tEnd);
+                    total = queryCount(tsReader, devicePath(device), measurement, tStart, tEnd);
                     t1 = System.nanoTime();
                     cpu1 = getProcessCpuNs();
                     tsReader.close();
@@ -361,18 +398,12 @@ public class TsFileNativeRunner {
         List<Map<String, Object>> results = new ArrayList<>();
         Random rng = new Random(42 + 400);
 
-        int nTargetMeas = Math.max(1, (int)(ALL_MEASUREMENTS.size() * 0.2));
+        int nTargetMeas = RANDOM_TARGET_MEASUREMENTS > 0
+                ? Math.min(RANDOM_TARGET_MEASUREMENTS, ALL_MEASUREMENTS.size())
+                : Math.max(1, (int)(ALL_MEASUREMENTS.size() * 0.2));
         List<String> shuffledMeas = new ArrayList<>(ALL_MEASUREMENTS);
         Collections.shuffle(shuffledMeas, new Random(42 + 400));
         List<String> targetMeas = shuffledMeas.subList(0, nTargetMeas);
-
-        long windowSpan = RANDOM_WINDOW_LENGTH * INTERVAL_SECONDS;
-        long[][] windows = new long[RANDOM_WINDOW_COUNT][2];
-        for (int w = 0; w < RANDOM_WINDOW_COUNT; w++) {
-            long ws = BASE_START + (long) rng.nextInt((int)(TOTAL_SECONDS - windowSpan));
-            windows[w][0] = ws;
-            windows[w][1] = ws + windowSpan;
-        }
 
         List<String> shuffledDevs = new ArrayList<>(devices);
         Collections.shuffle(shuffledDevs, new Random(42 + 400));
@@ -380,6 +411,21 @@ public class TsFileNativeRunner {
         List<String> testDevices = shuffledDevs.subList(0, nDevs);
 
         for (String device : testDevices) {
+            long devStart = deviceStartTimes.getOrDefault(device, BASE_START);
+            long devEnd = deviceEndTimes.getOrDefault(device, QUERY_END);
+            long windowSpan = (long) RANDOM_WINDOW_LENGTH * INTERVAL_SECONDS;
+            long[][] windows = new long[RANDOM_WINDOW_COUNT][2];
+            long maxStart = Math.max(devStart, devEnd - windowSpan);
+            for (int w = 0; w < RANDOM_WINDOW_COUNT; w++) {
+                long ws;
+                if (maxStart <= devStart) {
+                    ws = devStart;
+                } else {
+                    ws = devStart + (long) rng.nextInt((int)(maxStart - devStart + 1));
+                }
+                windows[w][0] = ws;
+                windows[w][1] = Math.min(ws + windowSpan, devEnd);
+            }
             int total = 0;
             long bytesRead = 0;
             long cpu0, cpu1, t0, t1;
@@ -390,7 +436,7 @@ public class TsFileNativeRunner {
                 t0 = System.nanoTime();
                 for (String meas : targetMeas) {
                     for (long[] win : windows) {
-                        total += lq.countRows(DEVICE_PATH, meas, win[0], win[1]);
+                        total += lq.countRows(devicePath(device), meas, win[0], win[1]);
                     }
                 }
                 t1 = System.nanoTime();
@@ -398,7 +444,7 @@ public class TsFileNativeRunner {
                 // bytesRead: use same fraction-based estimate as eager,
                 // but with lazy's more accurate per-measurement base cost
                 double fraction = Math.min(1.0,
-                        (double)(windowSpan * RANDOM_WINDOW_COUNT) / TOTAL_SECONDS);
+                        (double)(windowSpan * RANDOM_WINDOW_COUNT) / Math.max(1, devEnd - devStart + 1));
                 long perMeasCost = lq.getLastBytesRead() > 0
                         ? lq.getLastBytesRead()
                         : fileSize(device) / (ALL_MEASUREMENTS.size() + 1);
@@ -409,7 +455,7 @@ public class TsFileNativeRunner {
                 t0 = System.nanoTime();
                 for (String meas : targetMeas) {
                     for (long[] win : windows) {
-                        total += queryCount(tsReader, meas, win[0], win[1]);
+                        total += queryCount(tsReader, devicePath(device), meas, win[0], win[1]);
                     }
                 }
                 t1 = System.nanoTime();
@@ -417,7 +463,7 @@ public class TsFileNativeRunner {
                 tsReader.close();
 
                 double fraction = Math.min(1.0,
-                        (double)(windowSpan * RANDOM_WINDOW_COUNT) / TOTAL_SECONDS);
+                        (double)(windowSpan * RANDOM_WINDOW_COUNT) / Math.max(1, devEnd - devStart + 1));
                 bytesRead = (long)((fileSize(device) / (ALL_MEASUREMENTS.size() + 1))
                                     * nTargetMeas * fraction);
             }
@@ -436,6 +482,10 @@ public class TsFileNativeRunner {
 
     static long fileSize(String device) {
         return new File(deviceFiles.get(device)).length();
+    }
+
+    static String devicePath(String device) {
+        return devicePaths.getOrDefault(device, DEVICE_PATH);
     }
 
     static String toJson(Object obj) {

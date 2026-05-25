@@ -11,6 +11,7 @@ import json
 import sys
 import numpy as np
 import pandas as pd
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pyarrow.feather as feather
 import h5py
@@ -171,19 +172,57 @@ def _run_query_with_metrics(querier, method_name, args, byte_cost):
     }
 
 
+# ─── Shared long-table filtering helpers ────────────────────────────────
+
+def _filter_long_df(df, measurement, time_start, time_end):
+    mask = df["measurement"] == measurement
+    if time_start is not None:
+        mask &= df["time"] >= time_start
+    if time_end is not None:
+        mask &= df["time"] <= time_end
+    return df[mask]
+
+
+def _count_window_rows_from_df(df, target_measurements, windows):
+    total = 0
+    for meas in target_measurements:
+        meas_df = df.loc[df["measurement"] == meas]
+        times = meas_df["time"]
+        for (t_start, t_end) in windows:
+            total += int(((times >= t_start) & (times <= t_end)).sum())
+    return total
+
+
+def _measurement_expr(measurements):
+    expr = None
+    for meas in measurements:
+        cur = ds.field("measurement") == meas
+        expr = cur if expr is None else (expr | cur)
+    return expr
+
+
 # ─── Parquet Querier ───────────────────────────────────────────────────
 
-class ParquetQuerier:
+class ParquetNaiveQuerier:
     def __init__(self, data_dir):
         self.files = {f.stem: str(f) for f in data_dir.glob("*.parquet")}
         # Per-file cost: each file = one device, all measurements bundled
         self._file_cost = {dev: Path(p).stat().st_size for dev, p in self.files.items()}
+        self._measurement_count = {}
+        for dev, path in self.files.items():
+            try:
+                meas_col = pq.read_table(path, columns=["measurement"])["measurement"]
+                self._measurement_count[dev] = max(1, len(meas_col.unique()))
+            except Exception:
+                self._measurement_count[dev] = 15
 
     def _cost(self, device, measurement):
-        # Compressed bytes ≈ file_size / n_measurements (15 in our dataset)
-        # Measurement count discovered at runtime from benchmark patterns
+        # Compressed bytes ≈ file_size / n_measurements. This is still an
+        # estimate for long-table Parquet, but it avoids hard-coding the
+        # synthetic dataset's 15 measurements when running real datasets.
         fsize = self._file_cost.get(device, 0)
-        return fsize // 15 if fsize > 0 else 0
+        n_measurements = self._measurement_count.get(device, 15)
+        return fsize // n_measurements if fsize > 0 else 0
 
     def sequential_scan(self, device, measurement, time_start, time_end):
         table = pq.read_table(
@@ -214,7 +253,82 @@ class ParquetQuerier:
         return total
 
 
-class ArrowQuerier:
+class ParquetFileQuerier(ParquetNaiveQuerier):
+    """Reuse ParquetFile readers and batch random-window reads.
+
+    This is intentionally different from the naive path: it avoids reopening
+    the file and reparsing the footer for every training window.
+    """
+
+    def __init__(self, data_dir):
+        super().__init__(data_dir)
+        self._readers = {dev: pq.ParquetFile(path) for dev, path in self.files.items()}
+
+    def _read_df(self, device, columns=("measurement", "time", "value")):
+        return self._readers[device].read(columns=list(columns)).to_pandas()
+
+    def sequential_scan(self, device, measurement, time_start, time_end):
+        df = self._read_df(device)
+        return len(_filter_long_df(df, measurement, time_start, time_end))
+
+    def column_subset(self, device, target_measurements, time_start, time_end):
+        df = self._read_df(device)
+        mask = df["measurement"].isin(target_measurements)
+        if time_start is not None:
+            mask &= df["time"] >= time_start
+        if time_end is not None:
+            mask &= df["time"] <= time_end
+        return int(mask.sum())
+
+    def downsampling(self, device, measurement, time_start, time_end, step_n):
+        df = self._read_df(device)
+        return len(_filter_long_df(df, measurement, time_start, time_end).iloc[::step_n])
+
+    def random_windows(self, device, target_measurements, windows):
+        df = self._read_df(device)
+        return _count_window_rows_from_df(df, target_measurements, windows)
+
+
+class ParquetDatasetQuerier(ParquetNaiveQuerier):
+    """Use Arrow Dataset scanner projection/filter pushdown."""
+
+    def __init__(self, data_dir):
+        super().__init__(data_dir)
+        self._datasets = {
+            dev: ds.dataset(path, format="parquet") for dev, path in self.files.items()
+        }
+
+    def _scan_df(self, device, measurements, time_start=None, time_end=None):
+        if isinstance(measurements, str):
+            measurements = [measurements]
+        expr = _measurement_expr(measurements)
+        if time_start is not None:
+            expr = expr & (ds.field("time") >= time_start)
+        if time_end is not None:
+            expr = expr & (ds.field("time") <= time_end)
+        table = self._datasets[device].to_table(
+            columns=["measurement", "time", "value"],
+            filter=expr,
+        )
+        return table.to_pandas()
+
+    def sequential_scan(self, device, measurement, time_start, time_end):
+        return len(self._scan_df(device, measurement, time_start, time_end))
+
+    def column_subset(self, device, target_measurements, time_start, time_end):
+        return len(self._scan_df(device, target_measurements, time_start, time_end))
+
+    def downsampling(self, device, measurement, time_start, time_end, step_n):
+        return len(self._scan_df(device, measurement, time_start, time_end).iloc[::step_n])
+
+    def random_windows(self, device, target_measurements, windows):
+        min_start = min(w[0] for w in windows)
+        max_end = max(w[1] for w in windows)
+        df = self._scan_df(device, target_measurements, min_start, max_end)
+        return _count_window_rows_from_df(df, target_measurements, windows)
+
+
+class ArrowFeatherPandasQuerier:
     def __init__(self, data_dir):
         self.files = {f.stem: str(f) for f in data_dir.glob("*.arrow")}
         self._file_sizes = {dev: Path(p).stat().st_size for dev, p in self.files.items()}
@@ -259,6 +373,40 @@ class ArrowQuerier:
                 mask = (meas_df["time"] >= t_start) & (meas_df["time"] <= t_end)
                 total += int(mask.sum())
         return total
+
+
+class ArrowIPCProjectedQuerier(ArrowFeatherPandasQuerier):
+    """Read only required IPC columns and batch window filtering."""
+
+    def _read_df(self, device, columns=("measurement", "time", "value")):
+        table = feather.read_table(
+            self.files[device],
+            columns=list(columns),
+            memory_map=True,
+        )
+        return table.to_pandas()
+
+    def sequential_scan(self, device, measurement, time_start, time_end):
+        df = self._read_df(device)
+        return len(_filter_long_df(df, measurement, time_start, time_end))
+
+    def column_subset(self, device, target_measurements, time_start, time_end):
+        df = self._read_df(device)
+        mask = df["measurement"].isin(target_measurements)
+        if time_start is not None:
+            mask &= df["time"] >= time_start
+        if time_end is not None:
+            mask &= df["time"] <= time_end
+        return int(mask.sum())
+
+    def downsampling(self, device, measurement, time_start, time_end, step_n):
+        df = self._read_df(device)
+        subset = _filter_long_df(df, measurement, time_start, time_end)
+        return len(subset.iloc[::step_n])
+
+    def random_windows(self, device, target_measurements, windows):
+        df = self._read_df(device)
+        return _count_window_rows_from_df(df, target_measurements, windows)
 
 
 class HDF5Querier:
@@ -378,7 +526,7 @@ def run_pattern_2_column_subset(queriers, devices, measurements, n_runs=5):
                 # Byte cost: Arrow reads file once; others per-column
                 byte_cost = 0
                 if hasattr(q, '_cost'):
-                    if format_name == 'arrow':
+                    if format_name.startswith('arrow'):
                         byte_cost = q._cost(device, selected[0]) if selected else 0
                     else:
                         for m in selected:
@@ -441,39 +589,44 @@ def run_pattern_3_downsampling(queriers, devices, measurements, n_runs=5):
 def run_pattern_4_random_windows(queriers, devices, measurements):
     results = []
     rng = np.random.default_rng(cfg.SEED + 400)
+    preset_name = cfg.ACTIVE_AI_WINDOW_PRESET
+    preset = cfg.AI_WINDOW_PRESETS[preset_name]
+    n_windows = int(preset["num_windows"])
+    window_length = int(preset["window_length"])
 
     total_seconds = cfg.DURATION_DAYS * 86400
     base_start = int(datetime(2024, 1, 1, 0, 0, 0).timestamp())
     base_end = base_start + total_seconds
-    window_span_s = cfg.RANDOM_WINDOW_LENGTH * cfg.INTERVAL_SECONDS
+    window_span_s = window_length * cfg.INTERVAL_SECONDS
 
     windows = [
         (t_s := rng.integers(base_start, base_end - window_span_s),
          t_s + window_span_s)
-        for _ in range(cfg.RANDOM_WINDOW_COUNT)
+        for _ in range(n_windows)
     ]
 
     n_target_meas = max(1, int(len(measurements) * 0.2))
     target_measurements = rng.choice(measurements, n_target_meas, replace=False).tolist()
 
-    print(f"  [random_windows] {cfg.RANDOM_WINDOW_COUNT} windows, "
+    print(f"  [random_windows] preset={preset_name}, {n_windows} windows, "
+          f"window_length={window_length}, "
           f"{len(target_measurements)}/{len(measurements)} measurements")
 
     test_devices = rng.choice(devices, min(5, len(devices)), replace=False)
 
     for dev_idx, device in enumerate(test_devices):
         for format_name, q in queriers.items():
-            is_parquet_estimate = format_name == "parquet"
+            is_parquet_estimate = format_name == "parquet_naive"
             query_windows = windows[:PARQUET_P4_SAMPLE_WINDOWS] if is_parquet_estimate else windows
             scale = (len(windows) / len(query_windows)) if is_parquet_estimate else 1.0
 
             # Byte cost: each window touches a subset of the measurement's data
             # Estimate: windows cover (window_span_s * n_windows / total_span) fraction
-            fraction = min(1.0, (window_span_s * cfg.RANDOM_WINDOW_COUNT)
+            fraction = min(1.0, (window_span_s * n_windows)
                            / total_seconds)
             byte_cost = 0
             if hasattr(q, '_cost'):
-                if format_name == 'arrow':
+                if format_name.startswith('arrow'):
                     byte_cost = q._cost(device, target_measurements[0]) if target_measurements else 0
                 elif format_name == 'hdf5':
                     for m in target_measurements:
@@ -503,9 +656,14 @@ def run_pattern_4_random_windows(queriers, devices, measurements):
                 "pattern": "random_windows",
                 "format": format_name,
                 "device": str(device),
-                "n_windows": cfg.RANDOM_WINDOW_COUNT,
+                "ai_window_preset": preset_name,
+                "ai_window_sampling": preset.get("sampling"),
+                "ai_window_source": preset.get("source"),
+                "batch_size": preset.get("batch_size"),
+                "stride": preset.get("stride"),
+                "n_windows": n_windows,
                 "n_measurements": len(target_measurements),
-                "window_length": cfg.RANDOM_WINDOW_LENGTH,
+                "window_length": window_length,
                 **metrics,
             }
             if is_parquet_estimate:
@@ -556,12 +714,15 @@ def run_all_benchmarks(lazy=False):
 
     # Python queriers for Parquet, Arrow, HDF5
     queriers = {}
-    queriers["parquet"] = ParquetQuerier(parquet_dir)
-    print("[OK] Parquet querier ready")
+    queriers["parquet_naive"] = ParquetNaiveQuerier(parquet_dir)
+    queriers["parquet_file"] = ParquetFileQuerier(parquet_dir)
+    queriers["parquet_dataset"] = ParquetDatasetQuerier(parquet_dir)
+    print("[OK] Parquet queriers ready: naive, file, dataset")
 
     if arrow_dir.exists() and list(arrow_dir.glob("*.arrow")):
-        queriers["arrow"] = ArrowQuerier(arrow_dir)
-        print("[OK] Arrow IPC querier ready")
+        queriers["arrow_feather_pandas"] = ArrowFeatherPandasQuerier(arrow_dir)
+        queriers["arrow_ipc_projected"] = ArrowIPCProjectedQuerier(arrow_dir)
+        print("[OK] Arrow IPC queriers ready: feather_pandas, ipc_projected")
 
     if hdf5_path.exists():
         queriers["hdf5"] = HDF5Querier(hdf5_path)

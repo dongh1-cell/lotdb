@@ -32,7 +32,8 @@ import java.util.*;
 
 public class MultiResBenchmark {
 
-    static final int[] STEP_SIZES = {2, 5, 10, 50, 100, 500};
+    static final int[] STEP_SIZES = parseSteps(
+            System.getProperty("bench.steps", "2,5,10,50,100,500"));
     static final int N_WARMUP = 5;
     static final int N_MEASURE = 10;
 
@@ -57,12 +58,17 @@ public class MultiResBenchmark {
         Arrays.sort(multiFiles);
         Arrays.sort(origFiles);
 
-        // Use first device
-        String devName = multiFiles[0].getName().replace("_L0.tsfile", "");
-        String l0Path = multiFiles[0].getAbsolutePath();
+        // Use the largest device file by default. This avoids picking a short
+        // real-world series where high-step tests have too few target points.
+        File selectedL0 = multiFiles[0];
+        for (File f : multiFiles) {
+            if (f.length() > selectedL0.length()) selectedL0 = f;
+        }
+        String devName = selectedL0.getName().replace("_L0.tsfile", "");
+        String l0Path = selectedL0.getAbsolutePath();
         String l10Path = l0Path.replace("_L0.tsfile", "_L10.tsfile");
         String l100Path = l0Path.replace("_L0.tsfile", "_L100.tsfile");
-        String origPath = origFiles[0].getAbsolutePath();
+        String origPath = new File(origDir, devName + ".tsfile").getAbsolutePath();
 
         // Discover measurements and device path from ORIGINAL file
         TsFileSequenceReader r0orig = new TsFileSequenceReader(origPath);
@@ -129,7 +135,7 @@ public class MultiResBenchmark {
             }
 
             long levelFileSize = new File(levelPath).length();
-            int expectedTargets = n0 / step;
+            int expectedTargets = ceilDiv(n0, step);
 
             // --- Single-res: query original, iterate ALL, count 1/step ---
             TsFileSequenceReader seqOrig = new TsFileSequenceReader(origPath);
@@ -243,6 +249,19 @@ public class MultiResBenchmark {
         for (var cm : metas) total += (int) cm.getNumOfPoints();
         r.close();
         return total;
+    }
+
+    static int[] parseSteps(String text) {
+        String[] parts = text.split(",");
+        int[] steps = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            steps[i] = Integer.parseInt(parts[i].trim());
+        }
+        return steps;
+    }
+
+    static int ceilDiv(int value, int divisor) {
+        return (value + divisor - 1) / divisor;
     }
 
     static List<Double> readSampledValues(String filePath, String device, String meas,
